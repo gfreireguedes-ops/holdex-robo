@@ -1,0 +1,61 @@
+name: Mtrix diário
+
+on:
+  workflow_dispatch:          # botão de execução manual (para testar)
+    inputs:
+      data_inicio:
+        description: 'Data início (YYYY-MM-DD). Vazio = ontem.'
+        required: false
+      data_fim:
+        description: 'Data fim (YYYY-MM-DD). Vazio = igual ao início.'
+        required: false
+  schedule:
+    - cron: '0 11 * * *'      # todo dia 08:00 (horário de Brasília = 11:00 UTC)
+
+jobs:
+  gerar-e-enviar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Gerar arquivos Mtrix (somente Softys)
+        env:
+          CA_CLIENT_ID: ${{ secrets.CA_CLIENT_ID }}
+          CA_CLIENT_SECRET: ${{ secrets.CA_CLIENT_SECRET }}
+          CA_REFRESH_TOKEN: ${{ secrets.CA_REFRESH_TOKEN }}
+          DATA_INICIO: ${{ github.event.inputs.data_inicio }}
+          DATA_FIM: ${{ github.event.inputs.data_fim }}
+        run: node gerar_mtrix.js
+
+      - name: Conferir arquivos gerados
+        run: ls -la saida/
+
+      # Disponibiliza os arquivos para download na propria pagina da execucao
+      - name: Disponibilizar arquivos para download
+        uses: actions/upload-artifact@v4
+        with:
+          name: arquivos-mtrix
+          path: saida/*.txt
+
+      # Envio por e-mail - so funciona depois que os secrets SMTP forem cadastrados.
+      # continue-on-error: nao derruba a execucao se o e-mail ainda nao estiver configurado.
+      - name: Enviar por e-mail
+        continue-on-error: true
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_HOST }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          secure: true
+          username: ${{ secrets.SMTP_USER }}
+          password: ${{ secrets.SMTP_PASS }}
+          from: Robo Holdex <${{ secrets.SMTP_USER }}>
+          to: gabriel@holdex.com.br
+          subject: "Arquivos Mtrix - ${{ github.run_number }}"
+          body: |
+            Segue em anexo os sete arquivos Mtrix gerados automaticamente pelo robo Holdex.
+            (Somente produtos Softys/Elite.)
+          attachments: saida/*.txt
