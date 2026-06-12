@@ -47,10 +47,16 @@ if (!CLIENT_ID || !CLIENT_SECRET || !SUPABASE_URL || !SUPABASE_KEY) {
 
 // ---------- token no Supabase (lê o atual, grava o novo a cada renovação) ----------
 async function sbGetRefresh() {
-  const r = await fetch(`${SUPABASE_URL}/rest/v1/ca_auth?id=eq.1&select=refresh_token`, {
+  const url = `${SUPABASE_URL}/rest/v1/ca_auth?id=eq.1&select=refresh_token`;
+  const r = await fetch(url, {
     headers: { apikey: SUPABASE_KEY, Authorization: 'Bearer ' + SUPABASE_KEY }
   });
-  const d = await r.json().catch(() => []);
+  const txt = await r.text();
+  if (!r.ok) {
+    console.error('DIAGNÓSTICO leitura Supabase -> HTTP ' + r.status + ' | resposta: ' + txt.slice(0, 300));
+    console.error('URL usada: ' + SUPABASE_URL + '/rest/v1/ca_auth | chave começa com: ' + String(SUPABASE_KEY).slice(0, 12) + '...');
+  }
+  let d; try { d = JSON.parse(txt); } catch (e) { d = []; }
   return (Array.isArray(d) && d[0]) ? d[0].refresh_token : '';
 }
 async function sbSetRefresh(token) {
