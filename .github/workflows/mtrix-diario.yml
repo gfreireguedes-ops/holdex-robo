@@ -26,7 +26,8 @@ jobs:
         env:
           CA_CLIENT_ID: ${{ secrets.CA_CLIENT_ID }}
           CA_CLIENT_SECRET: ${{ secrets.CA_CLIENT_SECRET }}
-          CA_REFRESH_TOKEN: ${{ secrets.CA_REFRESH_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           DATA_INICIO: ${{ github.event.inputs.data_inicio }}
           DATA_FIM: ${{ github.event.inputs.data_fim }}
         run: node gerar_mtrix.js
