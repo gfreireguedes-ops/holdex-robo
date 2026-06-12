@@ -16,7 +16,8 @@ const fs = require('fs');
 // ---------- config ----------
 const CLIENT_ID = process.env.CA_CLIENT_ID;
 const CLIENT_SECRET = process.env.CA_CLIENT_SECRET;
-const REFRESH = process.env.CA_REFRESH_TOKEN;
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;   // service_role (lê e grava o token)
 const SIGLA = (process.env.MTX_SIGLA || 'MTRIX').toUpperCase();
 const CNPJ_FAB = (process.env.CNPJ_FAB || '44145845000221').replace(/\D/g, '');
 const CNPJ_HOLDEX = (process.env.CNPJ_HOLDEX || '24525054000139').replace(/\D/g, '');
@@ -30,19 +31,43 @@ function ontem() {
   const d = new Date(); d.setDate(d.getDate() - 1);
   return d.toISOString().split('T')[0];
 }
-const DATA_INICIO = process.env.DATA_INICIO || ontem();
-const DATA_FIM = process.env.DATA_FIM || DATA_INICIO;
+function normData(s) {
+  s = String(s || '').trim();
+  let m;
+  if (m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/)) return m[3] + '-' + m[2] + '-' + m[1]; // DD/MM/AAAA -> AAAA-MM-DD
+  return s; // já em AAAA-MM-DD (ou vazio)
+}
+const DATA_INICIO = normData(process.env.DATA_INICIO) || ontem();
+const DATA_FIM = normData(process.env.DATA_FIM) || DATA_INICIO;
 
-if (!CLIENT_ID || !CLIENT_SECRET || !REFRESH) {
-  console.error('Faltam secrets: CA_CLIENT_ID / CA_CLIENT_SECRET / CA_REFRESH_TOKEN');
+if (!CLIENT_ID || !CLIENT_SECRET || !SUPABASE_URL || !SUPABASE_KEY) {
+  console.error('Faltam secrets: CA_CLIENT_ID / CA_CLIENT_SECRET / SUPABASE_URL / SUPABASE_SERVICE_KEY');
   process.exit(1);
+}
+
+// ---------- token no Supabase (lê o atual, grava o novo a cada renovação) ----------
+async function sbGetRefresh() {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/ca_auth?id=eq.1&select=refresh_token`, {
+    headers: { apikey: SUPABASE_KEY, Authorization: 'Bearer ' + SUPABASE_KEY }
+  });
+  const d = await r.json().catch(() => []);
+  return (Array.isArray(d) && d[0]) ? d[0].refresh_token : '';
+}
+async function sbSetRefresh(token) {
+  await fetch(`${SUPABASE_URL}/rest/v1/ca_auth?id=eq.1`, {
+    method: 'PATCH',
+    headers: { apikey: SUPABASE_KEY, Authorization: 'Bearer ' + SUPABASE_KEY, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+    body: JSON.stringify({ refresh_token: token, updated_at: new Date().toISOString() })
+  });
 }
 
 // ---------- auth ----------
 let TOKEN = '';
 async function renovarToken() {
+  const refresh = await sbGetRefresh();
+  if (!refresh) throw new Error('Sem refresh token no Supabase (tabela ca_auth, id=1). Faça a semeadura conforme o README.');
   const creds = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
-  const body = `grant_type=refresh_token&refresh_token=${encodeURIComponent(REFRESH)}`;
+  const body = `grant_type=refresh_token&refresh_token=${encodeURIComponent(refresh)}`;
   const r = await fetch('https://auth.contaazul.com/oauth2/token', {
     method: 'POST',
     headers: { 'Authorization': `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -51,6 +76,8 @@ async function renovarToken() {
   const d = await r.json().catch(() => ({}));
   if (!d.access_token) throw new Error('Falha ao renovar token Conta Azul: ' + JSON.stringify(d));
   TOKEN = d.access_token;
+  // Conta Azul rotaciona o refresh: se veio um novo, guarda no Supabase para o próximo dia.
+  if (d.refresh_token && d.refresh_token !== refresh) await sbSetRefresh(d.refresh_token);
 }
 
 async function get(path) {
