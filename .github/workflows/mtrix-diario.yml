@@ -53,10 +53,14 @@ jobs:
           secure: true
           username: ${{ secrets.SMTP_USER }}
           password: ${{ secrets.SMTP_PASS }}
-          from: Robo Holdex <${{ secrets.SMTP_USER }}>
+          from: Holdex <${{ secrets.SMTP_USER }}>
           to: gabriel@holdex.com.br
           subject: "Arquivos Mtrix - ${{ github.run_number }}"
           body: |
-            Segue em anexo os sete arquivos Mtrix gerados automaticamente pelo robo Holdex.
-            (Somente produtos Softys/Elite.)
+            Prezados,
+
+            Seguem em anexo os arquivos de sellout da Holdex.
+
+            Atenciosamente,
+            Holdex
           attachments: saida/*.txt
