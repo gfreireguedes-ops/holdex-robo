@@ -1,14 +1,30 @@
 /* ============================================================
-   ROBÔ MTRIX — Holdex
+   ROBÔ MTRIX — Holdex (v2 — sincronizado com o Cockpit v29)
    Gera os 7 arquivos de sellout (somente produtos Softys/Elite)
    a partir do Conta Azul e grava em ./saida/ (latin-1 + CRLF).
    Roda no GitHub Actions; o envio por e-mail é feito no workflow.
+
+   CORREÇÕES nesta versão (vs. script anterior):
+   1) Filtro "bug do orçamento": exclui orçamento/cancelado/rascunho,
+      igual ao ehVendaReal() do Cockpit — CRÍTICO (evita inflar sellout).
+   2) Segmentação de clientes (tipo_loja): busca real da tabela
+      cliente_segmento no Supabase, com normalização tolerante.
+   3) Comodato: detecta também por CFOP (5908/5909/6908/6909),
+      não só pelo texto da natureza da operação.
+   4) Força de Vendas: usa o vendedor real da venda mais recente
+      de cada cliente (fallback: gerente), não mais nome fixo.
+   5) tipo_investimento: padrão agora é "1" (igual ao Cockpit).
+      Ajustável via MTX_INVESTIMENTO se precisar.
+   6) Notas fiscais (comodato): busca fatiada em janelas de 15 dias
+      com retry, para não truncar em períodos maiores.
+   7) Vendas: paginação completa (não trava mais em 1000 registros).
 
    Variáveis de ambiente (GitHub Secrets):
      CA_CLIENT_ID, CA_CLIENT_SECRET, CA_REFRESH_TOKEN
    Opcionais (com padrão):
      MTX_SIGLA=MTRIX  CNPJ_FAB=44145845000221  CNPJ_HOLDEX=24525054000139
-     MTX_VENDEDOR=VEND01  MTX_GERENTE=GABRIEL  MTX_INVESTIMENTO=2
+     MTX_VENDEDOR=VEND01  MTX_GERENTE=GABRIEL  MTX_INVESTIMENTO=1
+     MTX_COMODATO_REGEX=DISPENSER|SABONETEIRA
      DATA_INICIO / DATA_FIM (YYYY-MM-DD) — padrão: ontem
    ============================================================ */
 const fs = require('fs');
@@ -17,15 +33,16 @@ const fs = require('fs');
 const CLIENT_ID = process.env.CA_CLIENT_ID;
 const CLIENT_SECRET = process.env.CA_CLIENT_SECRET;
 const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;   // service_role (lê e grava o token)
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;   // service_role (lê e grava o token, e lê segmentação)
 const SIGLA = (process.env.MTX_SIGLA || 'MTRIX').toUpperCase();
 const CNPJ_FAB = (process.env.CNPJ_FAB || '44145845000221').replace(/\D/g, '');
 const CNPJ_HOLDEX = (process.env.CNPJ_HOLDEX || '24525054000139').replace(/\D/g, '');
 const VENDEDOR = process.env.MTX_VENDEDOR || 'VEND01';
 const GERENTE = process.env.MTX_GERENTE || 'GABRIEL';
-const INVEST = process.env.MTX_INVESTIMENTO || '2';
+const INVEST = process.env.MTX_INVESTIMENTO || '1';   // igual ao padrão do Cockpit (c.inv:'1')
 const PREFIXO_SOFTYS = '789606197';                 // GS1 da Softys (EAN/DUN)
-const RX_DISPENSER = /DISPENSER|SABONETEIRA/i;
+const RX_DISPENSER = new RegExp((process.env.MTX_COMODATO_REGEX || 'DISPENSER|SABONETEIRA'), 'i');
+const RX_CFOP_COMODATO = /^(5908|5909|6908|6909)$/;
 
 function ontem() {
   const d = new Date(); d.setDate(d.getDate() - 1);
@@ -67,6 +84,31 @@ async function sbSetRefresh(token) {
   });
 }
 
+// ---------- segmentação de clientes (Tipo de Loja / Mtrix) — igual ao segCarregar()/mxSeg() do Cockpit ----------
+async function sbCarregarSegmap() {
+  const segmap = {};
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/cliente_segmento?select=cliente,segmento`;
+    const r = await fetch(url, { headers: { apikey: SUPABASE_KEY, Authorization: 'Bearer ' + SUPABASE_KEY } });
+    const data = await r.json().catch(() => []);
+    (Array.isArray(data) ? data : []).forEach(row => { segmap[row.cliente] = row.segmento; });
+  } catch (e) {
+    console.error('Aviso: falha ao carregar cliente_segmento do Supabase — seguindo com GERAL. ' + e.message);
+  }
+  return segmap;
+}
+function segNorm(s) {
+  return String(s || '').toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/\b(LTDA|ME|EPP|EIRELI|S\/?A|SA|SOCIEDADE|COND|CONDOMINIO)\b/g, '')
+    .replace(/[^A-Z0-9]/g, '').trim();
+}
+function mxSeg(SEGMAP, nome) {
+  if (SEGMAP[nome]) return String(SEGMAP[nome]).slice(0, 10);
+  const alvo = segNorm(nome);
+  if (alvo) { for (const k in SEGMAP) { if (segNorm(k) === alvo) return String(SEGMAP[k]).slice(0, 10); } }
+  return 'GERAL';
+}
+
 // ---------- auth ----------
 let TOKEN = '';
 async function renovarToken() {
@@ -98,6 +140,31 @@ function items(res) {
   if (Array.isArray(res)) return res;
   for (const k of ['itens', 'items', 'data', 'content', 'results']) if (Array.isArray(res[k])) return res[k];
   return [];
+}
+
+// ---------- filtro "bug do orçamento" — idêntico ao ehVendaReal() do Cockpit ----------
+function ehVendaReal(v) {
+  const s = ((v.situacao && (v.situacao.nome || v.situacao)) || '').toString().toUpperCase().trim();
+  if (!s) return true;                                          // sem situação: mantém
+  if (s === 'ORCAMENTO_ACEITO' || s === 'ORÇAMENTO_ACEITO') return true;   // já é venda fechada
+  if (s === 'ORCAMENTO' || s === 'ORÇAMENTO') return false;      // proposta, não conta
+  if (s.includes('CANCEL') || s.includes('RASCUNHO') || s.includes('ANDAMENTO')) return false;
+  return true;                                                   // APROVADO, FATURADO, demais -> conta
+}
+
+// ---------- extrai nome do vendedor de uma venda (igual extrairVendedor() do Cockpit) ----------
+function extrairVendedor(det) {
+  if (!det || typeof det !== 'object') return '';
+  const cands = [det.vendedor, det.negociante, det.seller, det.responsavel, det.vendedor_responsavel, det.consultor];
+  for (const c of cands) {
+    if (!c) continue;
+    if (typeof c === 'string') return c;
+    if (typeof c === 'object' && (c.nome || c.name)) return c.nome || c.name;
+  }
+  for (const k of ['nome_vendedor', 'vendedor_nome', 'nomeVendedor']) {
+    if (typeof det[k] === 'string' && det[k]) return det[k];
+  }
+  return '';
 }
 
 // ---------- motor Mtrix (idêntico ao validado) ----------
@@ -145,6 +212,7 @@ function parseNFe(xml) {
   if (typeof xml !== 'string') xml = JSON.stringify(xml);
   const ide = (xml.match(/<ide>([\s\S]*?)<\/ide>/) || [, ''])[1];
   const dest = (xml.match(/<dest>([\s\S]*?)<\/dest>/) || [, ''])[1];
+  const ender = (dest.match(/<enderDest>([\s\S]*?)<\/enderDest>/) || [, ''])[1];
   const itens = [];
   const dets = xml.match(/<det[\s>][\s\S]*?<\/det>/g) || [];
   dets.forEach(d => {
@@ -152,7 +220,7 @@ function parseNFe(xml) {
     if (!prod) return;
     itens.push({ cProd: tag(prod, 'cProd'), cEAN: tag(prod, 'cEAN'), CFOP: tag(prod, 'CFOP'), qCom: Number(tag(prod, 'qCom') || 0) || 0, vUn: Number(tag(prod, 'vUnCom') || 0) || 0 });
   });
-  return { natOp: tag(ide, 'natOp'), tpNF: tag(ide, 'tpNF'), nNF: tag(ide, 'nNF'), dhEmi: (tag(ide, 'dhEmi') || '').slice(0, 10), docDest: tag(dest, 'CNPJ') || tag(dest, 'CPF'), cepDest: tag(dest, 'CEP'), itens };
+  return { natOp: tag(ide, 'natOp'), tpNF: tag(ide, 'tpNF'), nNF: tag(ide, 'nNF'), dhEmi: (tag(ide, 'dhEmi') || '').slice(0, 10), docDest: tag(dest, 'CNPJ') || tag(dest, 'CPF'), cepDest: tag(ender, 'CEP'), itens };
 }
 
 // ---------- detalhe de pessoa ----------
@@ -173,6 +241,33 @@ async function pessoaDet(id) {
   } catch (e) { return { doc: '', razao: '', endereco: '', bairro: '', cep: '', cidade: '', estado: '', responsavel: '', telefone: '' }; }
 }
 
+// ---------- notas fiscais fatiadas por período (igual mxBuscarNotasFatiado do Cockpit) ----------
+async function buscarNotasFatiado(deStr, ateStr) {
+  const todas = []; const vistos = new Set(); const jan = 15;
+  let ini = new Date(deStr + 'T12:00:00'); const fim = new Date(ateStr + 'T12:00:00');
+  let guarda = 0;
+  while (ini <= fim && guarda < 80) {
+    guarda++;
+    let f = new Date(ini); f.setDate(f.getDate() + jan - 1);
+    if (f > fim) f = new Date(fim);
+    const d1 = ini.toISOString().split('T')[0], d2 = f.toISOString().split('T')[0];
+    for (let pg = 1; pg <= 40; pg++) {
+      let r = null;
+      for (let tent = 1; tent <= 3; tent++) {
+        try { r = await get('/notas-fiscais?data_inicial=' + d1 + '&data_final=' + d2 + '&pagina=' + pg + '&tamanho_pagina=50'); } catch (e) { r = null; }
+        if (r && !r.error) break;
+        await new Promise(res => setTimeout(res, 300));
+      }
+      if (!r || r.error) { console.log('[NOTAS] fatia ' + d1 + '..' + d2 + ' pg' + pg + ' falhou'); break; }
+      const it = items(r);
+      it.forEach(n => { const k = n.chave_acesso || n.chave || n.id || JSON.stringify(n); if (!vistos.has(k)) { vistos.add(k); todas.push(n); } });
+      if (it.length < 50) break;
+    }
+    ini = new Date(f); ini.setDate(ini.getDate() + 1);
+  }
+  return todas;
+}
+
 // ---------- geração ----------
 async function gerar() {
   await renovarToken();
@@ -180,6 +275,9 @@ async function gerar() {
   const dt = new Date();
   const H = ex => Object.assign({ tipo: 'H', cnpj_fornecedor: CNPJ_FAB }, ex);
   const D = o => Object.assign({ tipo: 'D', cnpj_agente: CNPJ_HOLDEX }, o);
+
+  const SEGMAP = await sbCarregarSegmap();
+  console.log('Segmentação carregada:', Object.keys(SEGMAP).length, 'clientes');
 
   // catálogo
   let prods = [], pg = 1;
@@ -193,12 +291,25 @@ async function gerar() {
   });
   const resolveProd = it => { const t = leadTok(it.nome); return prodByCode[t] || prodByCode[t.replace(/^0+/, '')] || null; };
 
-  // vendas (sellout)
-  const vendas = items(await get('/venda/busca?pagina=1&tamanho_pagina=1000&data_inicio=' + DATA_INICIO + '&data_fim=' + DATA_FIM + '&campo_ordenado_descendente=DATA'));
-  const clienteIds = {}, cache = [];
+  // vendas (sellout) — paginação completa
+  let vendasTodas = items(await get('/venda/busca?pagina=1&tamanho_pagina=1000&data_inicio=' + DATA_INICIO + '&data_fim=' + DATA_FIM + '&campo_ordenado_descendente=DATA'));
+  if (vendasTodas.length >= 1000) {
+    for (let p = 2; p <= 30; p++) {
+      const r = await get('/venda/busca?pagina=' + p + '&tamanho_pagina=1000&data_inicio=' + DATA_INICIO + '&data_fim=' + DATA_FIM + '&campo_ordenado_descendente=DATA');
+      const it = items(r); vendasTodas = vendasTodas.concat(it); if (it.length < 1000) break;
+    }
+  }
+  const vendas = vendasTodas.filter(ehVendaReal);       // exclui orçamento/cancelado/rascunho
+  console.log('[VENDAS] total bruto:', vendasTodas.length, '-> vendas reais:', vendas.length);
+
+  const clienteIds = {}, cache = [], vendedorPorCli = {};
   for (const v of vendas) {
     const cliId = pick(v, ['cliente.id'], ''), cliNome = pick(v, ['cliente.nome'], '');
     if (cliId) clienteIds[cliId] = cliNome;
+    const dataV = pick(v, ['data', 'data_venda', 'criado_em'], dt);
+    let vend = extrairVendedor(v);
+    if (!vend && v.id) { try { const det = await get('/venda/' + v.id); vend = extrairVendedor(det); } catch (e) { } }
+    if (cliId && vend) { if (!vendedorPorCli[cliId] || dataV > vendedorPorCli[cliId].data) vendedorPorCli[cliId] = { nome: vend, data: dataV }; }
     let r = {}; try { r = await get('/venda/' + v.id + '/itens?pagina=1&tamanho_pagina=200'); } catch (e) { }
     const linhasItens = [];
     (pick(r, ['itens', 'produtos'], []) || []).forEach(it => {
@@ -212,18 +323,28 @@ async function gerar() {
   }
 
   // clientes (detalhe)
-  const clientesDict = {}, cliInfo = {};
-  for (const id of Object.keys(clienteIds)) { const ci = await pessoaDet(id); cliInfo[id] = ci; if (ci.doc) clientesDict[ci.doc] = ci; }
+  const clientesDict = {}, cliInfo = {}, vendedorPorDoc = {}, nomeVendaPorDoc = {};
+  for (const id of Object.keys(clienteIds)) {
+    const ci = await pessoaDet(id); cliInfo[id] = ci;
+    if (ci.doc) {
+      clientesDict[ci.doc] = ci;
+      if (vendedorPorCli[id]) vendedorPorDoc[ci.doc] = vendedorPorCli[id].nome;
+      if (clienteIds[id]) nomeVendaPorDoc[ci.doc] = clienteIds[id];
+    }
+  }
 
-  // comodato (NFs de remessa)
-  const nfs = items(await get('/notas-fiscais?data_inicial=' + DATA_INICIO + '&data_final=' + DATA_FIM + '&pagina=1&tamanho_pagina=100'));
+  // comodato (NFs de remessa) — fatiado + detecção por CFOP ou natOp
+  const nfs = await buscarNotasFatiado(DATA_INICIO, DATA_FIM);
   const lnK = [MX.linha('COMODATO_H', H({ identificador: 'COMODATO13' }))];
   let nCom = 0;
-  for (const nf of nfs.slice(0, 250)) {
-    const chave = pick(nf, ['chave_acesso', 'chave'], ''); if (!chave) continue;
+  const capNF = Math.min(nfs.length, 250);
+  for (let i = 0; i < capNF; i++) {
+    const nf = nfs[i];
+    const chave = pick(nf, ['chave_acesso', 'chave', 'chave_nfe'], ''); if (!chave) continue;
     let xml; try { xml = await get('/notas-fiscais/' + chave); } catch (e) { continue; }
     let info; try { info = parseNFe(xml); } catch (e) { continue; }
-    if (!/comodato/i.test(info.natOp)) continue;
+    const ehComodato = (info.itens || []).some(it => RX_CFOP_COMODATO.test(String(it.CFOP || '').trim())) || /comodato/i.test(info.natOp);
+    if (!ehComodato) continue;
     const transac = info.tpNF === '0' ? '2' : '1';
     const doc = sd(info.docDest);
     if (doc && !clientesDict[doc]) clientesDict[doc] = { doc, razao: pick(nf, ['nome_destinatario'], ''), endereco: '', bairro: '', cep: sd(info.cepDest), cidade: '', estado: '', responsavel: '', telefone: '' };
@@ -241,28 +362,40 @@ async function gerar() {
   let ln = [MX.linha('VENDAS_H', H({ identificador: 'VENDA11' }))];
   cache.forEach(s => { const ci = cliInfo[s.cliId] || {}; s.itens.forEach(it => { ln.push(MX.linha('VENDAS_D', D({ ident_cliente: ci.doc, data_transacao: s.data, num_documento: s.num, cod_produto: it.cod, quantidade: it.qtd, preco_venda: it.preco, cod_vendedor: VENDEDOR, tipo_doc: 'N', cep: ci.cep, tipo_unidade: '0001' }))); }); });
   out.push(['VENDAS', ln]);
-  // CLIENTES
+  // CLIENTES (com segmentação real)
   ln = [MX.linha('CLIENTES_H', H({ identificador: 'PDV10' }))];
-  Object.values(clientesDict).forEach(ci => ln.push(MX.linha('CLIENTES_D', D({ ident_cliente: ci.doc, razao_social: ci.razao, endereco: ci.endereco, bairro: ci.bairro, cep: ci.cep, cidade: ci.cidade, estado: ci.estado, responsavel: ci.responsavel, telefones: ci.telefone, cnpj_cpf: ci.doc, rota: 'BH', tipo_loja: 'GERAL' }))));
+  Object.keys(clientesDict).forEach(doc => {
+    const ci = clientesDict[doc];
+    const nomeSeg = nomeVendaPorDoc[doc] || ci.razao;
+    ln.push(MX.linha('CLIENTES_D', D({ ident_cliente: ci.doc, razao_social: ci.razao, endereco: ci.endereco, bairro: ci.bairro, cep: ci.cep, cidade: ci.cidade, estado: ci.estado, responsavel: ci.responsavel, telefones: ci.telefone, cnpj_cpf: ci.doc, rota: 'BH', tipo_loja: mxSeg(SEGMAP, nomeSeg) })));
+  });
   out.push(['CLIENTES', ln]);
   // PRODUTOS (só Softys)
   ln = [MX.linha('PRODUTOS_H', { tipo: 'H', identificador: 'CADPROD', data_arquivo: dt }), MX.linha('PRODUTOS_I', { tipo: 'I', cnpj_agente: CNPJ_HOLDEX })];
   prods.forEach(p => { const ean = sd(p.ean); if (!ehSoftys(ean)) return; const tcb = ean.length === 13 ? '1' : ean.length === 14 ? '2' : '3'; ln.push(MX.linha('PRODUTOS_V', { tipo: 'V', cnpj_fornecedor: CNPJ_FAB, razao_social_forn: 'SOFTYS BRASIL', cod_produto: String(p.codigo || ''), tipo_embalagem: '0', cod_barras: ean, tipo_cod_barras: tcb, nome_produto: p.nome || '', divisao_produto: 'HOLDEX', status: (p.status === 'INATIVO' ? 'I' : 'A') })); });
   out.push(['PRODUTOS', ln]);
-  // ESTOQUE (Softys, não-dispenser)
+  // ESTOQUE (Softys, não-dispenser) + ESTOQUE COMODATO (Softys dispensers)
   ln = [MX.linha('ESTOQUE_H', H({ identificador: 'ESTOQ11', data_estoque: dt }))];
-  prods.forEach(p => { const ean = sd(p.ean); if (!ehSoftys(ean) || RX_DISPENSER.test(p.nome || '')) return; const q = Math.max(0, Number(p.saldo != null ? p.saldo : 0) || 0); ln.push(MX.linha('ESTOQUE_E', { tipo: 'E', cnpj_agente: CNPJ_HOLDEX, cod_produto: ean || String(p.codigo || ''), qtd_estoque: q, tipo_unidade: '0001' })); });
+  let lnEC = [MX.linha('ESTOQUE_COM_H', H({ identificador: 'ESTOQ12', data_estoque: dt }))];
+  prods.forEach(p => {
+    const ean = sd(p.ean); if (!ehSoftys(ean)) return;
+    const cod = ean || String(p.codigo || '');
+    const q = Math.max(0, Number(p.saldo != null ? p.saldo : 0) || 0);
+    if (RX_DISPENSER.test(p.nome || '')) { lnEC.push(MX.linha('ESTOQUE_COM_E', { tipo: 'E', cnpj_agente: CNPJ_HOLDEX, cod_produto: cod, qtd_estoque: Math.round(q), tipo_transacao: 'C', cod_patrimonio: '' })); }
+    else { ln.push(MX.linha('ESTOQUE_E', { tipo: 'E', cnpj_agente: CNPJ_HOLDEX, cod_produto: cod, qtd_estoque: q, tipo_unidade: '0001' })); }
+  });
   out.push(['ESTOQUE', ln]);
-  // ESTOQUE COMODATO (Softys dispensers)
-  ln = [MX.linha('ESTOQUE_COM_H', H({ identificador: 'ESTOQ12', data_estoque: dt }))];
-  prods.forEach(p => { const ean = sd(p.ean); if (!ehSoftys(ean) || !RX_DISPENSER.test(p.nome || '')) return; const q = Math.max(0, Number(p.saldo != null ? p.saldo : 0) || 0); ln.push(MX.linha('ESTOQUE_COM_E', { tipo: 'E', cnpj_agente: CNPJ_HOLDEX, cod_produto: ean || String(p.codigo || ''), qtd_estoque: Math.round(q), tipo_transacao: 'C', cod_patrimonio: '' })); });
-  out.push(['ESTOQUECOM', ln]);
-  // FORÇA DE VENDAS
+  // FORÇA DE VENDAS (vendedor real por cliente, fallback gerente)
   ln = [MX.linha('FV_H', H({ identificador: 'FV10' }))];
-  Object.keys(clientesDict).forEach(doc => ln.push(MX.linha('FV_D', D({ ident_cliente: doc, cod_gerente: 'GER01', nome_gerente: GERENTE, cod_supervisor: 'SUP01', nome_supervisor: GERENTE, cod_vendedor: VENDEDOR, nome_vendedor: GERENTE }))));
+  Object.keys(clientesDict).forEach(doc => {
+    const vendReal = vendedorPorDoc[doc] || GERENTE;
+    ln.push(MX.linha('FV_D', D({ ident_cliente: doc, cod_gerente: 'GER01', nome_gerente: GERENTE, cod_supervisor: 'SUP01', nome_supervisor: GERENTE, cod_vendedor: VENDEDOR, nome_vendedor: vendReal })));
+  });
   out.push(['FORCAVENDAS', ln]);
   // COMODATO
   out.push(['COMODATO', lnK]);
+  // ESTOQUE COMODATO
+  out.push(['ESTOQUECOM', lnEC]);
 
   // grava em latin-1 + CRLF
   fs.mkdirSync('saida', { recursive: true });
