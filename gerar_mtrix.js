@@ -41,6 +41,7 @@ const VENDEDOR = process.env.MTX_VENDEDOR || 'VEND01';
 const GERENTE = process.env.MTX_GERENTE || 'GABRIEL';
 const INVEST = process.env.MTX_INVESTIMENTO || '1';   // igual ao padrão do Cockpit (c.inv:'1')
 const PREFIXO_SOFTYS = '789606197';                 // GS1 da Softys (EAN/DUN)
+const EAN_SOFTYS_EXTRA = new Set(['7898437735939','7896914012436']); // Elite Professional fora do prefixo GS1 padrão (confirmado pela Mtrix em set/2026)
 const RX_DISPENSER = new RegExp((process.env.MTX_COMODATO_REGEX || 'DISPENSER|SABONETEIRA'), 'i');
 const RX_CFOP_COMODATO = /^(5908|5909|6908|6909)$/;
 
@@ -204,7 +205,7 @@ const MX = (function () {
 const sd = v => String(v == null ? '' : v).replace(/\D/g, '');
 const pick = (o, keys, def) => { if (!o) return def; for (const k of keys) { const v = k.split('.').reduce((a, c) => (a == null ? a : a[c]), o); if (v !== undefined && v !== null && v !== '') return v; } return def; };
 const leadTok = s => String(s || '').split(' - ')[0].trim();
-const ehSoftys = ean => sd(ean).includes(PREFIXO_SOFTYS);
+const ehSoftys = ean => { const e = sd(ean); return e.includes(PREFIXO_SOFTYS) || EAN_SOFTYS_EXTRA.has(e); };
 
 // ---------- parser NF-e (regex, sem dependência) ----------
 function tag(xml, t) { const m = xml.match(new RegExp('<' + t + '>([^<]*)</' + t + '>')); return m ? m[1] : ''; }
