@@ -1,5 +1,4 @@
 name: Mtrix diário
-
 on:
   workflow_dispatch:          # botão de execução manual (para testar)
     inputs:
@@ -9,20 +8,60 @@ on:
       data_fim:
         description: 'Data fim (YYYY-MM-DD). Vazio = igual ao início.'
         required: false
+      sftp:
+        description: 'SFTP Mtrix: nao = só gera | testar = só conecta e lista a pasta | enviar = gera e envia de verdade'
+        required: true
+        default: 'nao'
+        type: choice
+        options:
+          - nao
+          - testar
+          - enviar
   schedule:
     - cron: '0 11 * * *'      # todo dia 08:00 (horário de Brasília = 11:00 UTC)
-
 jobs:
   gerar-e-enviar:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
 
+      # ---------- Teste de conexão SFTP (não gera nem envia arquivos) ----------
+      - name: Instalar lftp
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.sftp != 'nao' }}
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq lftp
+      - name: Testar conexão SFTP (somente lista a pasta)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.sftp == 'testar' }}
+        env:
+          SFTP_HOST: ${{ secrets.SFTP_HOST }}
+          SFTP_PORT: ${{ secrets.SFTP_PORT }}
+          SFTP_USER: ${{ secrets.SFTP_USER }}
+          LFTP_PASSWORD: ${{ secrets.SFTP_PASS }}
+          SFTP_DIR: ${{ secrets.SFTP_DIR }}
+        run: |
+          if [ -z "$SFTP_HOST" ] || [ -z "$SFTP_USER" ] || [ -z "$LFTP_PASSWORD" ]; then
+            echo "Faltam secrets: SFTP_HOST, SFTP_USER e SFTP_PASS são obrigatórios."
+            exit 1
+          fi
+          DIR="${SFTP_DIR:-.}"
+          PORT="${SFTP_PORT:-22}"
+          lftp --env-password -u "$SFTP_USER" "sftp://$SFTP_HOST:$PORT" <<EOF
+          set cmd:fail-exit yes
+          set sftp:auto-confirm yes
+          set net:max-retries 2
+          set net:timeout 30
+          cd "$DIR"
+          pwd
+          cls -l
+          bye
+          EOF
+          echo "Conexão SFTP OK."
+
+      # ---------- Geração dos arquivos ----------
       - name: Gerar arquivos Mtrix (somente Softys)
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.sftp != 'testar' }}
         env:
           CA_CLIENT_ID: ${{ secrets.CA_CLIENT_ID }}
           CA_CLIENT_SECRET: ${{ secrets.CA_CLIENT_SECRET }}
@@ -31,20 +70,19 @@ jobs:
           DATA_INICIO: ${{ github.event.inputs.data_inicio }}
           DATA_FIM: ${{ github.event.inputs.data_fim }}
         run: node gerar_mtrix.js
-
       - name: Conferir arquivos gerados
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.sftp != 'testar' }}
         run: ls -la saida/
-
       # Disponibiliza os arquivos para download na propria pagina da execucao
       - name: Disponibilizar arquivos para download
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.sftp != 'testar' }}
         uses: actions/upload-artifact@v4
         with:
           name: arquivos-mtrix
           path: saida/*.txt
-
-      # Envio por e-mail - so funciona depois que os secrets SMTP forem cadastrados.
-      # continue-on-error: nao derruba a execucao se o e-mail ainda nao estiver configurado.
+      # Cópia por e-mail (registro/backup). Não derruba a execução se falhar.
       - name: Enviar por e-mail
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.sftp != 'testar' }}
         continue-on-error: true
         uses: dawidd6/action-send-mail@v3
         with:
@@ -58,9 +96,37 @@ jobs:
           subject: "Arquivos Mtrix - ${{ github.run_number }}"
           body: |
             Prezados,
-
             Seguem em anexo os arquivos de sellout da Holdex.
-
             Atenciosamente,
             Holdex
           attachments: saida/*.txt
+
+      # ---------- Envio para a Mtrix via SFTP ----------
+      # Roda sempre no agendamento diário. Em execução manual, só envia se sftp = enviar
+      # (assim um teste com período diferente de "ontem" nunca vai parar na Mtrix por engano).
+      - name: Enviar para a Mtrix via SFTP
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.sftp == 'enviar' }}
+        env:
+          SFTP_HOST: ${{ secrets.SFTP_HOST }}
+          SFTP_PORT: ${{ secrets.SFTP_PORT }}
+          SFTP_USER: ${{ secrets.SFTP_USER }}
+          LFTP_PASSWORD: ${{ secrets.SFTP_PASS }}
+          SFTP_DIR: ${{ secrets.SFTP_DIR }}
+        run: |
+          if [ -z "$SFTP_HOST" ] || [ -z "$SFTP_USER" ] || [ -z "$LFTP_PASSWORD" ]; then
+            echo "Faltam secrets: SFTP_HOST, SFTP_USER e SFTP_PASS são obrigatórios."
+            exit 1
+          fi
+          DIR="${SFTP_DIR:-.}"
+          PORT="${SFTP_PORT:-22}"
+          lftp --env-password -u "$SFTP_USER" "sftp://$SFTP_HOST:$PORT" <<EOF
+          set cmd:fail-exit yes
+          set sftp:auto-confirm yes
+          set net:max-retries 3
+          set net:timeout 30
+          cd "$DIR"
+          mput saida/*.txt
+          cls -l
+          bye
+          EOF
+          echo "Envio SFTP concluído."
