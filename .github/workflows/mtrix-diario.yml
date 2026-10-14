@@ -50,6 +50,7 @@ jobs:
           lftp --env-password -u "$SFTP_USER" "sftp://$SFTP_HOST:$PORT" <<EOF
           set cmd:fail-exit yes
           set sftp:auto-confirm yes
+          set sftp:connect-program "ssh -a -x -oHostKeyAlgorithms=+ssh-rsa"
           set net:max-retries 2
           set net:timeout 30
           cd "$DIR"
@@ -122,6 +123,7 @@ jobs:
           lftp --env-password -u "$SFTP_USER" "sftp://$SFTP_HOST:$PORT" <<EOF
           set cmd:fail-exit yes
           set sftp:auto-confirm yes
+          set sftp:connect-program "ssh -a -x -oHostKeyAlgorithms=+ssh-rsa"
           set net:max-retries 3
           set net:timeout 30
           cd "$DIR"
