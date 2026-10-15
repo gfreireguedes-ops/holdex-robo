@@ -43,13 +43,15 @@ const INVEST = process.env.MTX_INVESTIMENTO || '1';   // igual ao padrão do Coc
 const PREFIXO_SOFTYS = '789606197';                 // GS1 da Softys (EAN/DUN)
 // Elite Professional fora do prefixo GS1 padrão (confirmado pela Mtrix). Base de 12 dígitos dos EAN-13 7898437735939 e 7896914012436:
 // casa tanto com o EAN-13 quanto com o DUN-14 (14 dígitos), que é como o Conta Azul guarda os produtos.
-const EAN_SOFTYS_BASES = ['789843773593','789691401243'];
+const EAN_SOFTYS_BASES = ['789843773593','789691401243','789606190022']; // 789606190022 = 207253 TOALHA PAP ELITE ROLO EXCE FD 8X150
 const RX_DISPENSER = new RegExp((process.env.MTX_COMODATO_REGEX || 'DISPENSER|SABONETEIRA'), 'i');
 const RX_CFOP_COMODATO = /^(5908|5909|6908|6909)$/;
 
 function ontem() {
+  // usa o fuso do processo (o workflow define TZ=America/Sao_Paulo); antes usava UTC e errava o dia em execuções manuais à noite
   const d = new Date(); d.setDate(d.getDate() - 1);
-  return d.toISOString().split('T')[0];
+  const p2 = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate());
 }
 function normData(s) {
   s = String(s || '').trim();
@@ -285,6 +287,12 @@ async function gerar() {
   // catálogo
   let prods = [], pg = 1;
   for (let i = 0; i < 12; i++) { const r = await get('/produtos?pagina=' + pg + '&tamanho_pagina=500'); const it = items(r); prods = prods.concat(it); if (it.length < 500) break; pg++; }
+  // Alerta: produtos com SKU 207xxx (padrão Softys) que o filtro por código de barras deixou de fora
+  const foraDoFiltro = prods.filter(p => /^207/.test(String(p.codigo || '')) && !ehSoftys(p.ean));
+  if (foraDoFiltro.length) {
+    console.log('ATENCAO: ' + foraDoFiltro.length + ' produto(s) com SKU 207 FORA do filtro Softys (conferir o código de barras):');
+    foraDoFiltro.forEach(p => console.log('  ' + p.codigo + ' | EAN ' + (sd(p.ean) || '(vazio)') + ' | ' + p.nome));
+  }
   const prodByCode = {};
   prods.forEach(p => {
     const rec = { ean: sd(p.ean), codigo: String(p.codigo || ''), nome: p.nome || '', saldo: Number(p.saldo != null ? p.saldo : 0) || 0, status: (p.status === 'INATIVO' ? 'I' : 'A') };
