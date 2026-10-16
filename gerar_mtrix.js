@@ -133,12 +133,22 @@ async function renovarToken() {
   if (d.refresh_token && d.refresh_token !== refresh) await sbSetRefresh(d.refresh_token);
 }
 
+let REPETICOES = 0;
 async function get(path) {
-  const r = await fetch('https://api-v2.contaazul.com/v1' + path, {
-    headers: { 'Authorization': 'Bearer ' + TOKEN }
-  });
-  const txt = await r.text();
-  try { return JSON.parse(txt); } catch (e) { return txt; }   // NF-e volta como XML (string)
+  // tenta de novo quando o Conta Azul limita (429) ou falha (5xx); antes uma falha virava "sem dados" sem aviso
+  for (let tent = 1; tent <= 5; tent++) {
+    const r = await fetch('https://api-v2.contaazul.com/v1' + path, {
+      headers: { 'Authorization': 'Bearer ' + TOKEN }
+    });
+    if (r.status === 429 || r.status >= 500) {
+      REPETICOES++;
+      await new Promise(res => setTimeout(res, 1000 * tent));
+      continue;
+    }
+    const txt = await r.text();
+    try { return JSON.parse(txt); } catch (e) { return txt; }   // NF-e volta como XML (string)
+  }
+  throw new Error('Conta Azul indisponivel ou limite de chamadas excedido em ' + path);
 }
 function items(res) {
   if (!res || res.error) return [];
@@ -321,7 +331,7 @@ async function gerar() {
     let vend = extrairVendedor(v);
     if (!vend && v.id) { try { const det = await get('/venda/' + v.id); vend = extrairVendedor(det); } catch (e) { } }
     if (cliId && vend) { if (!vendedorPorCli[cliId] || dataV > vendedorPorCli[cliId].data) vendedorPorCli[cliId] = { nome: vend, data: dataV }; }
-    let r = {}; try { r = await get('/venda/' + v.id + '/itens?pagina=1&tamanho_pagina=200'); } catch (e) { }
+    const r = await get('/venda/' + v.id + '/itens?pagina=1&tamanho_pagina=200');
     const linhasItens = [];
     (pick(r, ['itens', 'produtos'], []) || []).forEach(it => {
       if (it.tipo && it.tipo !== 'PRODUTO') return;
@@ -349,6 +359,7 @@ async function gerar() {
   const lnK = [MX.linha('COMODATO_H', H({ identificador: 'COMODATO13' }))];
   let nCom = 0;
   const capNF = Math.min(nfs.length, 250);
+  if (nfs.length > capNF) console.log('ATENCAO: ' + nfs.length + ' notas fiscais no periodo, lendo so as ' + capNF + ' primeiras (comodato pode ficar incompleto). Rode por periodos menores.');
   for (let i = 0; i < capNF; i++) {
     const nf = nfs[i];
     const chave = pick(nf, ['chave_acesso', 'chave', 'chave_nfe'], ''); if (!chave) continue;
@@ -419,6 +430,7 @@ async function gerar() {
   });
   console.log('Arquivos gerados:\n  ' + resumo.join('\n  '));
   console.log(`\nResumo: ${cache.length} vendas Softys, ${nCom} itens de comodato, ${Object.keys(clientesDict).length} clientes.`);
+  if (REPETICOES) console.log('Chamadas repetidas por limite/erro do Conta Azul: ' + REPETICOES);
 }
 
 gerar().catch(e => { console.error('ERRO:', e.message); process.exit(1); });
