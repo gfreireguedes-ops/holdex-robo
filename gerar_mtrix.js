@@ -234,7 +234,7 @@ function classificar(p) {
   const nome = String((p && p.nome) || '');
   if (BLOQUEADOS.includes(sku) || RX_BLOQ_SKU.test(sku) || RX_BLOQ_NOME.test(nome)) return 'BLOQUEADO';   // o bloqueio vence sempre
   if (PERMITIDOS.includes(sku)) return 'SOFTYS';
-  if (/^20/.test(sku)) return 'SOFTYS';                                                                   // SKU padrão Softys
+  if (/^20\d{4}$/.test(sku)) return 'SOFTYS';                                                             // SKU padrão Softys: 6 digitos comecando com 20 (ex: 2090 NAO entra)
   if (e.includes(PREFIXO_SOFTYS) || EAN_SOFTYS_BASES.some(b => e.includes(b))) return 'SOFTYS';          // código de barras Softys (dispensers etc.)
   return 'SEM_CLASSIFICACAO';
 }
