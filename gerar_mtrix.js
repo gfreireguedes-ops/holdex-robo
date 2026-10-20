@@ -25,6 +25,8 @@
      MTX_SIGLA=MTRIX  CNPJ_FAB=44145845000221  CNPJ_HOLDEX=24525054000139
      MTX_VENDEDOR=VEND01  MTX_GERENTE=GABRIEL  MTX_INVESTIMENTO=1
      MTX_COMODATO_REGEX=DISPENSER|SABONETEIRA
+     MTX_PERMITIDOS=SKU1,SKU2   (SKUs liberados como Softys, alem da regra automatica)
+     MTX_BLOQUEIO=SKU1,SKU2     (SKUs que NUNCA vao para a Softys)
      DATA_INICIO / DATA_FIM (YYYY-MM-DD) — padrão: ontem
    ============================================================ */
 const fs = require('fs');
@@ -219,7 +221,24 @@ const MX = (function () {
 const sd = v => String(v == null ? '' : v).replace(/\D/g, '');
 const pick = (o, keys, def) => { if (!o) return def; for (const k of keys) { const v = k.split('.').reduce((a, c) => (a == null ? a : a[c]), o); if (v !== undefined && v !== null && v !== '') return v; } return def; };
 const leadTok = s => String(s || '').split(' - ')[0].trim();
-const ehSoftys = ean => { const e = sd(ean); return e.includes(PREFIXO_SOFTYS) || EAN_SOFTYS_BASES.some(b => e.includes(b)); };
+// ---------- classificação de produtos: SOFTYS / BLOQUEADO / SEM_CLASSIFICACAO ----------
+// Só SOFTYS vai para os arquivos. BLOQUEADO nunca vai (sigilo). SEM_CLASSIFICACAO não vai, mas é avisado no e-mail para decisão.
+const listaEnv = v => String(v || '').split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
+const PERMITIDOS = listaEnv(process.env.MTX_PERMITIDOS);
+const BLOQUEADOS = ['111194'].concat(listaEnv(process.env.MTX_BLOQUEIO));   // 111194 = All Clean
+const RX_BLOQ_SKU = /^FREECO/i;
+const RX_BLOQ_NOME = /FREECO|ALL CLEAN/i;
+function classificar(p) {
+  const sku = String((p && p.codigo) || '').trim().toUpperCase();
+  const e = sd(p && p.ean);
+  const nome = String((p && p.nome) || '');
+  if (BLOQUEADOS.includes(sku) || RX_BLOQ_SKU.test(sku) || RX_BLOQ_NOME.test(nome)) return 'BLOQUEADO';   // o bloqueio vence sempre
+  if (PERMITIDOS.includes(sku)) return 'SOFTYS';
+  if (/^20/.test(sku)) return 'SOFTYS';                                                                   // SKU padrão Softys
+  if (e.includes(PREFIXO_SOFTYS) || EAN_SOFTYS_BASES.some(b => e.includes(b))) return 'SOFTYS';          // código de barras Softys (dispensers etc.)
+  return 'SEM_CLASSIFICACAO';
+}
+const ehSoftys = p => classificar(p) === 'SOFTYS';
 
 // ---------- parser NF-e (regex, sem dependência) ----------
 function tag(xml, t) { const m = xml.match(new RegExp('<' + t + '>([^<]*)</' + t + '>')); return m ? m[1] : ''; }
@@ -233,7 +252,7 @@ function parseNFe(xml) {
   dets.forEach(d => {
     const prod = (d.match(/<prod>([\s\S]*?)<\/prod>/) || [, ''])[1];
     if (!prod) return;
-    itens.push({ cProd: tag(prod, 'cProd'), cEAN: tag(prod, 'cEAN'), CFOP: tag(prod, 'CFOP'), qCom: Number(tag(prod, 'qCom') || 0) || 0, vUn: Number(tag(prod, 'vUnCom') || 0) || 0 });
+    itens.push({ cProd: tag(prod, 'cProd'), cEAN: tag(prod, 'cEAN'), xProd: tag(prod, 'xProd'), CFOP: tag(prod, 'CFOP'), qCom: Number(tag(prod, 'qCom') || 0) || 0, vUn: Number(tag(prod, 'vUnCom') || 0) || 0 });
   });
   return { natOp: tag(ide, 'natOp'), tpNF: tag(ide, 'tpNF'), nNF: tag(ide, 'nNF'), dhEmi: (tag(ide, 'dhEmi') || '').slice(0, 10), docDest: tag(dest, 'CNPJ') || tag(dest, 'CPF'), cepDest: tag(ender, 'CEP'), itens };
 }
@@ -297,11 +316,14 @@ async function gerar() {
   // catálogo
   let prods = [], pg = 1;
   for (let i = 0; i < 12; i++) { const r = await get('/produtos?pagina=' + pg + '&tamanho_pagina=500'); const it = items(r); prods = prods.concat(it); if (it.length < 500) break; pg++; }
-  // Alerta: produtos com SKU 207xxx (padrão Softys) que o filtro por código de barras deixou de fora
-  const foraDoFiltro = prods.filter(p => /^207/.test(String(p.codigo || '')) && !ehSoftys(p.ean));
-  if (foraDoFiltro.length) {
-    console.log('ATENCAO: ' + foraDoFiltro.length + ' produto(s) com SKU 207 FORA do filtro Softys (conferir o código de barras):');
-    foraDoFiltro.forEach(p => console.log('  ' + p.codigo + ' | EAN ' + (sd(p.ean) || '(vazio)') + ' | ' + p.nome));
+  // Classificação do catálogo (Softys / bloqueado / sem classificação)
+  const AVISOS = [], semClassVendidos = {}, naoReconhecidos = [];
+  let bloqueadosVendidos = 0;
+  const semClass = prods.filter(p => classificar(p) === 'SEM_CLASSIFICACAO');
+  console.log('[CATALOGO] ' + prods.length + ' produtos: Softys=' + prods.filter(ehSoftys).length + ' | bloqueados=' + prods.filter(p => classificar(p) === 'BLOQUEADO').length + ' | sem classificacao=' + semClass.length);
+  if (semClass.length) {
+    console.log('PRODUTOS SEM CLASSIFICACAO (nao enviados; informe quais sao Softys):');
+    semClass.forEach(p => console.log('  ' + (p.codigo || '(sem SKU)') + ' | EAN ' + (sd(p.ean) || '(vazio)') + ' | ' + p.nome));
   }
   const prodByCode = {};
   prods.forEach(p => {
@@ -335,8 +357,20 @@ async function gerar() {
     const linhasItens = [];
     (pick(r, ['itens', 'produtos'], []) || []).forEach(it => {
       if (it.tipo && it.tipo !== 'PRODUTO') return;
-      const pr = resolveProd(it); if (!pr) return;
-      if (!ehSoftys(pr.ean)) return;                 // SÓ SOFTYS
+      const pr = resolveProd(it);
+      if (!pr) {
+        if (RX_BLOQ_NOME.test(it.nome || '')) { bloqueadosVendidos++; return; }
+        naoReconhecidos.push({ pedido: String(pick(v, ['numero', 'id'], '')), nome: it.nome || '(sem nome)', campos: Object.keys(it).join(',') });
+        return;
+      }
+      const cl = classificar(pr);
+      if (cl === 'BLOQUEADO') { bloqueadosVendidos++; return; }
+      if (cl !== 'SOFTYS') {
+        const k = pr.codigo || pr.nome;
+        semClassVendidos[k] = semClassVendidos[k] || { sku: pr.codigo, nome: pr.nome, qtd: 0 };
+        semClassVendidos[k].qtd += Number(it.quantidade || 0) || 0;
+        return;
+      }
       if (RX_DISPENSER.test(pr.nome)) return;        // dispenser não é sellout
       linhasItens.push({ cod: pr.cod, qtd: Number(it.quantidade || 0) || 0, preco: Number(it.valor || 0) || 0 });
     });
@@ -359,7 +393,7 @@ async function gerar() {
   const lnK = [MX.linha('COMODATO_H', H({ identificador: 'COMODATO13' }))];
   let nCom = 0;
   const capNF = Math.min(nfs.length, 250);
-  if (nfs.length > capNF) console.log('ATENCAO: ' + nfs.length + ' notas fiscais no periodo, lendo so as ' + capNF + ' primeiras (comodato pode ficar incompleto). Rode por periodos menores.');
+  if (nfs.length > capNF) { const m = 'ATENCAO: ' + nfs.length + ' notas fiscais no periodo, lendo so as ' + capNF + ' primeiras (comodato pode ficar incompleto). Rode por periodos menores.'; console.log(m); AVISOS.push(m); }
   for (let i = 0; i < capNF; i++) {
     const nf = nfs[i];
     const chave = pick(nf, ['chave_acesso', 'chave', 'chave_nfe'], ''); if (!chave) continue;
@@ -371,7 +405,7 @@ async function gerar() {
     const doc = sd(info.docDest);
     if (doc && !clientesDict[doc]) clientesDict[doc] = { doc, razao: pick(nf, ['nome_destinatario'], ''), endereco: '', bairro: '', cep: sd(info.cepDest), cidade: '', estado: '', responsavel: '', telefone: '' };
     info.itens.forEach(it => {
-      if (!ehSoftys(it.cEAN)) return;
+      if (!ehSoftys({ codigo: it.cProd, ean: it.cEAN, nome: it.xProd })) return;
       const eanOk = /^\d{13,14}$/.test(it.cEAN);
       lnK.push(MX.linha('COMODATO_D', D({ ident_cliente: doc, cnpj_intermediario: '', data_transacao: info.dhEmi, num_documento: String(info.nNF || pick(nf, ['numero_nota'], '')), cod_produto: eanOk ? it.cEAN : it.cProd, quantidade: it.qCom, preco_venda: it.vUn, cod_promotor: VENDEDOR, tipo_doc: 'C', cep: sd(info.cepDest), data_fim_contrato: '', tipo_investimento: INVEST, cod_vendedor: VENDEDOR, tipo_transacao: transac, cod_patrimonio: '' })));
       nCom++;
@@ -394,13 +428,14 @@ async function gerar() {
   out.push(['CLIENTES', ln]);
   // PRODUTOS (só Softys)
   ln = [MX.linha('PRODUTOS_H', { tipo: 'H', identificador: 'CADPROD', data_arquivo: dt }), MX.linha('PRODUTOS_I', { tipo: 'I', cnpj_agente: CNPJ_HOLDEX })];
-  prods.forEach(p => { const ean = sd(p.ean); if (!ehSoftys(ean)) return; const tcb = ean.length === 13 ? '1' : ean.length === 14 ? '2' : '3'; ln.push(MX.linha('PRODUTOS_V', { tipo: 'V', cnpj_fornecedor: CNPJ_FAB, razao_social_forn: 'SOFTYS BRASIL', cod_produto: String(p.codigo || ''), tipo_embalagem: '0', cod_barras: ean, tipo_cod_barras: tcb, nome_produto: p.nome || '', divisao_produto: 'HOLDEX', status: (p.status === 'INATIVO' ? 'I' : 'A') })); });
+  const semBarras = []; prods.forEach(p => { if (!ehSoftys(p)) return; const ean = sd(p.ean); if (!ean) semBarras.push(p); const tcb = ean.length === 13 ? '1' : ean.length === 14 ? '2' : '3'; ln.push(MX.linha('PRODUTOS_V', { tipo: 'V', cnpj_fornecedor: CNPJ_FAB, razao_social_forn: 'SOFTYS BRASIL', cod_produto: String(p.codigo || ''), tipo_embalagem: '0', cod_barras: ean || String(p.codigo || ''), tipo_cod_barras: tcb, nome_produto: p.nome || '', divisao_produto: 'HOLDEX', status: (p.status === 'INATIVO' ? 'I' : 'A') })); });
   out.push(['PRODUTOS', ln]);
   // ESTOQUE (Softys, não-dispenser) + ESTOQUE COMODATO (Softys dispensers)
   ln = [MX.linha('ESTOQUE_H', H({ identificador: 'ESTOQ11', data_estoque: dt }))];
   let lnEC = [MX.linha('ESTOQUE_COM_H', H({ identificador: 'ESTOQ12', data_estoque: dt }))];
   prods.forEach(p => {
-    const ean = sd(p.ean); if (!ehSoftys(ean)) return;
+    if (!ehSoftys(p)) return;
+    const ean = sd(p.ean);
     const cod = ean || String(p.codigo || '');
     const q = Math.max(0, Number(p.saldo != null ? p.saldo : 0) || 0);
     if (RX_DISPENSER.test(p.nome || '')) { lnEC.push(MX.linha('ESTOQUE_COM_E', { tipo: 'E', cnpj_agente: CNPJ_HOLDEX, cod_produto: cod, qtd_estoque: Math.round(q), tipo_transacao: 'C', cod_patrimonio: '' })); }
@@ -431,6 +466,29 @@ async function gerar() {
   console.log('Arquivos gerados:\n  ' + resumo.join('\n  '));
   console.log(`\nResumo: ${cache.length} vendas Softys, ${nCom} itens de comodato, ${Object.keys(clientesDict).length} clientes.`);
   if (REPETICOES) console.log('Chamadas repetidas por limite/erro do Conta Azul: ' + REPETICOES);
+
+  // ---------- resumo para o e-mail (fica em ./resumo, fora de ./saida: NUNCA vai para a Mtrix) ----------
+  const cont = {}; out.forEach(([pref, linhas]) => { cont[pref] = linhas.length - (pref === 'PRODUTOS' ? 2 : 1); });
+  const linhasVenda = cache.reduce((a, c) => a + c.itens.length, 0);
+  const R = [];
+  R.push('Arquivos Mtrix gerados. Periodo: ' + DATA_INICIO + ' a ' + DATA_FIM);
+  R.push('Vendas Softys: ' + cache.length + ' pedidos, ' + linhasVenda + ' linhas');
+  R.push('Clientes: ' + cont.CLIENTES + ' | Produtos: ' + cont.PRODUTOS + ' | Estoque: ' + cont.ESTOQUE + ' itens | Estoque comodato: ' + cont.ESTOQUECOM + ' itens | Comodato: ' + cont.COMODATO + ' itens');
+  R.push('Itens de produtos bloqueados ignorados: ' + bloqueadosVendidos);
+  const sv = Object.values(semClassVendidos);
+  if (sv.length) { R.push(''); R.push('ATENCAO: ' + sv.length + ' produto(s) VENDIDO(S) sem classificacao (NAO enviados). Informe se sao Softys:'); sv.forEach(x => R.push('  ' + (x.sku || '(sem SKU)') + ' | ' + x.nome + ' | qtd ' + x.qtd)); }
+  if (naoReconhecidos.length) {
+    R.push(''); R.push('ATENCAO: ' + naoReconhecidos.length + ' item(ns) vendido(s) NAO reconhecido(s) no catalogo (nao enviados):');
+    naoReconhecidos.slice(0, 40).forEach(x => R.push('  pedido ' + x.pedido + ' | ' + x.nome));
+    R.push('  campos do item na API: ' + naoReconhecidos[0].campos);
+  }
+  if (semBarras.length) { R.push(''); R.push('ATENCAO: ' + semBarras.length + ' produto(s) Softys SEM codigo de barras (enviados com o SKU no lugar):'); semBarras.slice(0, 40).forEach(p => R.push('  ' + p.codigo + ' | ' + p.nome)); }
+  AVISOS.forEach(a => { R.push(''); R.push(a); });
+  if (semClass.length) { R.push(''); R.push('AVISO: ' + semClass.length + ' produto(s) do catalogo sem classificacao (nao enviados). Lista completa no log da execucao.'); semClass.slice(0, 40).forEach(p => R.push('  ' + (p.codigo || '(sem SKU)') + ' | ' + p.nome)); if (semClass.length > 40) R.push('  ... e mais ' + (semClass.length - 40)); }
+  if (REPETICOES) { R.push(''); R.push('Chamadas repetidas por limite do Conta Azul: ' + REPETICOES); }
+  fs.mkdirSync('resumo', { recursive: true });
+  fs.writeFileSync('resumo/resumo.txt', R.join('\n') + '\n', 'utf8');
+  console.log('\n--- RESUMO ---\n' + R.join('\n'));
 }
 
 gerar().catch(e => { console.error('ERRO:', e.message); process.exit(1); });
