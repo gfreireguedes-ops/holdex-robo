@@ -76,6 +76,8 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           DATA_INICIO: ${{ github.event.inputs.data_inicio }}
           DATA_FIM: ${{ github.event.inputs.data_fim }}
+          MTX_PERMITIDOS: ${{ vars.MTX_PERMITIDOS }}
+          MTX_BLOQUEIO: ${{ vars.MTX_BLOQUEIO }}
         run: node gerar_mtrix.js
       - name: Conferir arquivos gerados
         if: ${{ github.event_name == 'schedule' || github.event.inputs.sftp != 'testar' }}
@@ -87,7 +89,17 @@ jobs:
         with:
           name: arquivos-mtrix
           path: saida/*.txt
-      # Cópia por e-mail (registro/backup). Não derruba a execução se falhar.
+      # Assunto do e-mail diário: começa com ATENCAO quando o resumo traz algum aviso
+      - name: Preparar assunto do e-mail
+        id: resumo
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.sftp != 'testar' }}
+        run: |
+          if [ -f resumo/resumo.txt ] && grep -q '^ATENCAO' resumo/resumo.txt; then
+            echo "assunto=ATENCAO Arquivos Mtrix ${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "assunto=Arquivos Mtrix ${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          fi
+      # Cópia por e-mail (registro/backup) com o resumo no corpo. Não derruba a execução se falhar.
       - name: Enviar por e-mail
         if: ${{ github.event_name == 'schedule' || github.event.inputs.sftp != 'testar' }}
         continue-on-error: true
@@ -100,12 +112,8 @@ jobs:
           password: ${{ secrets.SMTP_PASS }}
           from: Holdex <${{ secrets.SMTP_USER }}>
           to: gabriel@holdex.com.br
-          subject: "Arquivos Mtrix - ${{ github.run_number }}"
-          body: |
-            Prezados,
-            Seguem em anexo os arquivos de sellout da Holdex.
-            Atenciosamente,
-            Holdex
+          subject: ${{ steps.resumo.outputs.assunto }}
+          body: file://resumo/resumo.txt
           attachments: saida/*.txt
 
       # ---------- Envio para a Mtrix via SFTP ----------
@@ -138,3 +146,22 @@ jobs:
           bye
           EOF
           echo "Envio SFTP concluído."
+
+      # ---------- Aviso de erro ----------
+      # Se qualquer passo acima falhar, avisa por e-mail com o link da execução.
+      - name: Avisar por e-mail em caso de erro
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_HOST }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          secure: true
+          username: ${{ secrets.SMTP_USER }}
+          password: ${{ secrets.SMTP_PASS }}
+          from: Holdex <${{ secrets.SMTP_USER }}>
+          to: gabriel@holdex.com.br
+          subject: "ERRO Mtrix diario ${{ github.run_number }}"
+          body: |
+            A execucao do Mtrix diario falhou.
+            Veja o detalhe em: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Se for erro no envio por SFTP, os arquivos do dia ficam no artefato arquivos-mtrix, na pagina da execucao.
